@@ -187,23 +187,11 @@ mod error {
 pub use self::error::Error;
 use crate::ops::expression::Error::{UndefinedVariable, UnknownLabel, UnknownMacro};
 use crate::ops::{self, AbstractOp, Assemble, Expression, MacroDefinition};
-use etk_ops::cancun::Op;
+use etk_ops::cancun::{JumpDest, Op, Pop, Push1};
 use indexmap::IndexMap;
 use num_bigint::{BigInt, Sign};
 use rand::Rng;
 use std::collections::{hash_map, HashMap, HashSet};
-
-/// EVM opcode for `JUMPDEST`. Used by the `--evmgif` chunker as the entry
-/// point inside the first header (`<size> JUMPDEST POP`).
-const EVMGIF_JUMPDEST: u8 = 0x5b;
-
-/// EVM opcode for `POP`. Used to consume the size byte that `PUSH1` pushed at
-/// the start of each non-initial chunk header.
-const EVMGIF_POP: u8 = 0x50;
-
-/// EVM opcode for `PUSH1`. Wraps the size byte in every non-initial chunk
-/// header so executing the header is a no-op for the EVM.
-const EVMGIF_PUSH1: u8 = 0x60;
 
 /// Maximum number of user-code bytes that may live between two consecutive
 /// chunk headers (or between the final header and end-of-output). Combined
@@ -516,23 +504,23 @@ fn assemble_chunked(unchunked: &[u8], boundaries: &ChunkBoundaries) -> Vec<u8> {
         if idx == 0 {
             // First header: <size> JUMPDEST POP. The JUMPDEST byte is taken
             // from the user's first instruction (already validated to be
-            // 0x5b), so we don't copy `unchunked[0]` again into the chunk
-            // body — it lives inside the header.
+            // JUMPDEST), so we don't copy `unchunked[0]` again into the
+            // chunk body — it lives inside the header.
             //
             // `<size>` counts the bytes that follow it before the next
             // header (or end-of-output): JUMPDEST + POP + content_len.
             let size = (2 + content_len) as u8;
             out.push(size);
-            out.push(EVMGIF_JUMPDEST);
-            out.push(EVMGIF_POP);
+            out.push(u8::from(JumpDest));
+            out.push(u8::from(Pop));
         } else {
             // Subsequent headers: PUSH1 <size> POP. `<size>` counts the
             // bytes after itself up to the next header (POP + content_len),
             // which is at most 254 — within byte range.
             let size = (1 + content_len) as u8;
-            out.push(EVMGIF_PUSH1);
+            out.push(u8::from(Push1::<()>(())));
             out.push(size);
-            out.push(EVMGIF_POP);
+            out.push(u8::from(Pop));
         }
 
         out.extend_from_slice(&unchunked[chunk_start..end]);
@@ -880,7 +868,7 @@ impl Assembler {
         // only byte we can position at offset+1 without disturbing the user's
         // code is the user's first instruction, so it must be a JUMPDEST.
         let first = unchunked.first().copied();
-        if first != Some(EVMGIF_JUMPDEST) {
+        if first != Some(u8::from(JumpDest)) {
             return error::EvmGifFirstNotJumpdest { actual: first }.fail();
         }
 
@@ -2041,9 +2029,9 @@ mod tests {
         // PUSH1 <size_1 = 1 + 1 = 2> POP (3)
         // Chunk 1 content: 1 GAS byte.
         let mut expected = EVMGIF_MAGIC.to_vec();
-        expected.extend_from_slice(&[255u8, EVMGIF_JUMPDEST, EVMGIF_POP]);
+        expected.extend_from_slice(&[255u8, u8::from(JumpDest), u8::from(Pop)]);
         expected.extend(std::iter::repeat(0x5a).take(253));
-        expected.extend_from_slice(&[EVMGIF_PUSH1, 0x02, EVMGIF_POP]);
+        expected.extend_from_slice(&[u8::from(Push1::<()>(())), 0x02, u8::from(Pop)]);
         expected.push(0x5a);
         assert_eq!(result, expected);
         Ok(())
@@ -2075,11 +2063,11 @@ mod tests {
 
         // Sanity-check chunk 1 header sits in the right place: chunk 0
         // spans bytes 12..265 of output; header 1 at 265..268.
-        assert_eq!(result[265], EVMGIF_PUSH1);
+        assert_eq!(result[265], u8::from(Push1::<()>(())));
         // size_1 = 1 (POP) + (final chunk content length)
         // chunk 1 content = JUMPDEST(dest) + PUSH2 + 2 bytes = 4
         assert_eq!(result[266], 0x05);
-        assert_eq!(result[267], EVMGIF_POP);
+        assert_eq!(result[267], u8::from(Pop));
 
         // And the leading 9 bytes are the magic identifier.
         assert_eq!(&result[..9], &EVMGIF_MAGIC);
