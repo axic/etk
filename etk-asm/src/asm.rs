@@ -177,9 +177,11 @@ use rand::Rng;
 use std::collections::{hash_map, HashMap, HashSet};
 
 /// Maximum number of user-code bytes that may live between two consecutive
-/// chunk headers (or between the final header and end-of-output). Combined
-/// with the 3-byte header this keeps the inter-header span at most 256 bytes,
-/// per the `--evmgif` spec.
+/// chunk headers (or between the final header and end-of-output). Subsequent
+/// chunk headers are 3 bytes (`PUSH1 <size> POP`); combined with 253 content
+/// bytes that keeps each inter-header span at 256 bytes, per the `--evmgif`
+/// spec. The first chunk's preamble is only 2 bytes (`<size> JUMPDEST`), so
+/// chunk 0's payload sits comfortably under the same limit.
 const EVMGIF_MAX_CHUNK_CONTENT: usize = 253;
 
 /// Magic bytes that prefix every `--evmgif` payload. The first three bytes
@@ -371,41 +373,36 @@ fn decode_instruction_starts(bytes: &[u8]) -> Vec<usize> {
 
 /// Decide where to insert chunk headers. The user's instructions are
 /// packed into chunks of at most [`EVMGIF_MAX_CHUNK_CONTENT`] bytes each,
-/// never splitting an instruction. The preamble (`<size> JUMPDEST POP`) is
+/// never splitting an instruction. The preamble (`<size> JUMPDEST`) is
 /// emitted separately, so chunk 0 begins at instruction index 0 of the
 /// unchunked output.
 ///
 /// Returns one [`ChunkBoundaries::header_at`] entry per chunk; `header_at[0]`
 /// is always `0`.
 fn plan_chunks(instr_starts: &[usize], unchunked_len: usize) -> ChunkBoundaries {
-    let mut header_at = vec![0usize];
+    // Real EVM instructions cap at PUSH32 = 33 bytes, well under our 253-byte
+    // chunk budget. `%include_hex` bytes are walked one-by-one by
+    // `decode_instruction_starts`, so they also stay at 1 byte each. A
+    // single-instruction overflow is therefore a logic bug — assert it.
+    debug_assert!(
+        instr_starts
+            .iter()
+            .zip(instr_starts.iter().skip(1).chain(std::iter::once(&unchunked_len)))
+            .all(|(start, end)| end - start <= EVMGIF_MAX_CHUNK_CONTENT),
+        "evmgif: encountered an instruction wider than the chunk budget"
+    );
 
+    let mut header_at = vec![0usize];
     let mut current_chunk_start = 0usize;
 
     // Walk every user instruction. For each one, either it fits in the
     // current chunk or it starts a new one.
-    for idx in 0..instr_starts.len() {
-        let instr_start = instr_starts[idx];
+    for (idx, &instr_start) in instr_starts.iter().enumerate() {
         let instr_end = if idx + 1 < instr_starts.len() {
             instr_starts[idx + 1]
         } else {
             unchunked_len
         };
-        let instr_size = instr_end - instr_start;
-
-        // If a single instruction is wider than the chunk budget there is
-        // nothing we can do — we can't split it. Bail by giving it its own
-        // chunk; the resulting size byte will overflow and the caller will
-        // see EvmGifPushOverflow further down (or, for non-push wide ops,
-        // produce an oversized size byte which we cap below).
-        if instr_size > EVMGIF_MAX_CHUNK_CONTENT {
-            if current_chunk_start != instr_start {
-                header_at.push(instr_start);
-            }
-            current_chunk_start = instr_start;
-            // Force the next instruction (if any) into a fresh chunk too.
-            continue;
-        }
 
         let bytes_in_current = instr_end - current_chunk_start;
         if bytes_in_current > EVMGIF_MAX_CHUNK_CONTENT {
@@ -420,10 +417,10 @@ fn plan_chunks(instr_starts: &[usize], unchunked_len: usize) -> ChunkBoundaries 
     }
 }
 
-/// Build a lookup from unchunked offsets to chunked offsets. Only positions
-/// that can appear in a label or push (instruction starts plus the leading
-/// JUMPDEST at 0) are entered, since intermediate bytes never appear in any
-/// resolved expression.
+/// Build a lookup from unchunked offsets to chunked offsets. Only
+/// instruction-start positions are entered; intermediate bytes inside a
+/// multi-byte push never appear in any resolved expression, so they don't
+/// need a mapping.
 fn build_position_map(
     instr_starts: &[usize],
     boundaries: &ChunkBoundaries,
@@ -447,12 +444,14 @@ fn build_position_map(
     map
 }
 
-/// Construct the chunked output: leading `<size_0> JUMPDEST POP`, then each
+/// Construct the chunked output: leading `<size_0> JUMPDEST`, then each
 /// chunk's user bytes preceded (for chunks ≥ 1) by `PUSH1 <size_N> POP`.
 fn assemble_chunked(unchunked: &[u8], boundaries: &ChunkBoundaries) -> Vec<u8> {
     let headers = &boundaries.header_at;
-    let mut out =
-        Vec::with_capacity(EVMGIF_MAGIC.len() + unchunked.len() + 3 * headers.len());
+    // 9 magic bytes + 2-byte first header + 3 bytes per subsequent header
+    // + the user's bytecode.
+    let header_bytes = 2 + 3 * headers.len().saturating_sub(1);
+    let mut out = Vec::with_capacity(EVMGIF_MAGIC.len() + header_bytes + unchunked.len());
 
     // Every `--evmgif` payload opens with the 9-byte magic identifier so
     // the wrapping file can distinguish embedded EVM payloads from other
@@ -853,8 +852,8 @@ impl Assembler {
         let instr_starts = decode_instruction_starts(&unchunked);
 
         // 2. Partition the user's instructions into chunks. The header is
-        // assembler-emitted preamble (`<size> JUMPDEST POP`) and is not
-        // taken from the user's bytecode, so chunk 0's content starts at
+        // assembler-emitted preamble (`<size> JUMPDEST`) and is not taken
+        // from the user's bytecode, so chunk 0's content starts at
         // instruction index 0.
         let chunk_boundaries = plan_chunks(&instr_starts, unchunked.len());
 
@@ -868,18 +867,28 @@ impl Assembler {
         // inserting headers at chunk boundaries.
         let chunked = assemble_chunked(&unchunked, &chunk_boundaries);
 
-        // 5. Update declared labels to their chunked + offset positions so
-        // we can re-evaluate the expressions of label-bearing pushes.
-        for value in self.declared_labels.values_mut() {
-            if let Some(ref mut def) = value {
-                let chunked_pos = position_map
-                    .get(&def.position)
-                    .copied()
-                    .expect("label position must be an instruction boundary");
-                def.position = chunked_pos + offset as usize;
-                def.updated = true;
-            }
-        }
+        // 5. Build a snapshot of the label map with chunked + offset
+        // positions for re-evaluating push expressions. We don't mutate
+        // `self.declared_labels` — the Assembler isn't reused after
+        // assemble() returns, but keeping the canonical map untouched
+        // makes the side effects of this pass obvious.
+        let chunked_labels: IndexMap<String, Option<LabelDef>> = self
+            .declared_labels
+            .iter()
+            .map(|(name, def)| {
+                let new_def = def.map(|d| {
+                    let chunked_pos = position_map
+                        .get(&d.position)
+                        .copied()
+                        .expect("label position must be an instruction boundary");
+                    LabelDef {
+                        position: chunked_pos + offset as usize,
+                        updated: true,
+                    }
+                });
+                (name.clone(), new_def)
+            })
+            .collect();
 
         // 6. Re-evaluate each tracked label-push and rewrite the immediate
         // in place. The push's chunked location comes from the same mapping
@@ -896,7 +905,7 @@ impl Assembler {
 
             let value = push
                 .expr
-                .eval_with_context((&self.declared_labels, &self.declared_macros).into())
+                .eval_with_context((&chunked_labels, &self.declared_macros).into())
                 .expect("labels resolved during emit must still resolve");
 
             let (sign, bytes) = value.to_bytes_be();
