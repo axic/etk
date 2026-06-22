@@ -262,12 +262,25 @@ impl Program {
 #[derive(Debug)]
 pub struct Ingest<W> {
     output: W,
+    evmgif_offset: Option<u64>,
 }
 
 impl<W> Ingest<W> {
     /// Make a new `Ingest` that writes assembled bytes to `output`.
     pub fn new(output: W) -> Self {
-        Self { output }
+        Self {
+            output,
+            evmgif_offset: None,
+        }
+    }
+
+    /// Make a new `Ingest` that emits its output in `--evmgif` chunked form
+    /// at the given base offset. See [`Assembler::with_evmgif_offset`].
+    pub fn with_evmgif_offset(output: W, offset: u64) -> Self {
+        Self {
+            output,
+            evmgif_offset: Some(offset),
+        }
     }
 }
 
@@ -304,7 +317,10 @@ where
     {
         let mut program = Program::new(path.into());
         let nodes = self.preprocess(&mut program, src)?;
-        let mut asm = Assembler::new();
+        let mut asm = match self.evmgif_offset {
+            Some(offset) => Assembler::with_evmgif_offset(offset),
+            None => Assembler::new(),
+        };
         let raw = asm.assemble(&nodes)?;
 
         self.output.write_all(&raw).context(error::Io {

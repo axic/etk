@@ -16,6 +16,23 @@ struct Opt {
     input: PathBuf,
     #[structopt(parse(from_os_str))]
     out: Option<PathBuf>,
+
+    /// Emit `--evmgif` chunked output at the given base byte offset.
+    ///
+    /// Resolves every label-bearing push to `offset + chunked_position` and
+    /// interleaves `PUSH1 <size> POP` headers so each inter-header span is
+    /// at most 256 bytes. The first header is `<size> JUMPDEST POP`, so the
+    /// input's first instruction must be a JUMPDEST (it becomes the entry
+    /// point at `offset + 1`). Accepts decimal or `0x`-prefixed hexadecimal.
+    #[structopt(long = "evmgif", value_name = "OFFSET", parse(try_from_str = parse_offset))]
+    evmgif: Option<u64>,
+}
+
+fn parse_offset(src: &str) -> Result<u64, std::num::ParseIntError> {
+    match src.strip_prefix("0x").or_else(|| src.strip_prefix("0X")) {
+        Some(rest) => u64::from_str_radix(rest, 16),
+        None => src.parse::<u64>(),
+    }
 }
 
 fn create(path: PathBuf) -> File {
@@ -45,7 +62,10 @@ fn run() -> Result<(), Error> {
 
     let hex_out = HexWrite::new(&mut out);
 
-    let mut ingest = Ingest::new(hex_out);
+    let mut ingest = match opt.evmgif {
+        Some(offset) => Ingest::with_evmgif_offset(hex_out, offset),
+        None => Ingest::new(hex_out),
+    };
     ingest.ingest_file(opt.input)?;
 
     out.write_all(b"\n").unwrap();

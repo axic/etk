@@ -137,16 +137,79 @@ mod error {
             /// The location of the error.
             backtrace: Backtrace,
         },
+
+        /// `--evmgif` was requested but the first emitted instruction is not
+        /// `JUMPDEST`. `evmgif` packages the output so the caller jumps to the
+        /// byte immediately following the chunk-size marker, which must be a
+        /// `JUMPDEST`.
+        #[snafu(display(
+            "evmgif requires the first instruction to be JUMPDEST (0x5b); found {}",
+            actual.map(|b| format!("0x{:02x}", b)).unwrap_or_else(|| "empty output".into())
+        ))]
+        #[non_exhaustive]
+        EvmGifFirstNotJumpdest {
+            /// The byte that was actually emitted first, if any.
+            actual: Option<u8>,
+
+            /// The location of the error.
+            backtrace: Backtrace,
+        },
+
+        /// A push referencing a label could not be widened to fit the value
+        /// produced by the `--evmgif` transformation (chunk shift + base
+        /// offset). The user must request a larger fixed push, or rely on
+        /// `%push` so the assembler can choose a size.
+        #[snafu(display(
+            "evmgif: value 0x{:x} for expression `{}` does not fit into push{}",
+            value,
+            expr,
+            push_size,
+        ))]
+        #[non_exhaustive]
+        EvmGifPushOverflow {
+            /// The expression whose evaluated value overflowed the push.
+            expr: Expression,
+
+            /// The evaluated value (after applying the chunk shift and base
+            /// offset).
+            value: BigInt,
+
+            /// The size in bytes of the push immediate that could not hold the
+            /// value.
+            push_size: usize,
+
+            /// The location of the error.
+            backtrace: Backtrace,
+        },
     }
 }
 
 pub use self::error::Error;
 use crate::ops::expression::Error::{UndefinedVariable, UnknownLabel, UnknownMacro};
 use crate::ops::{self, AbstractOp, Assemble, Expression, MacroDefinition};
+use etk_ops::cancun::Op;
 use indexmap::IndexMap;
-use num_bigint::BigInt;
+use num_bigint::{BigInt, Sign};
 use rand::Rng;
 use std::collections::{hash_map, HashMap, HashSet};
+
+/// EVM opcode for `JUMPDEST`. Used by the `--evmgif` chunker as the entry
+/// point inside the first header (`<size> JUMPDEST POP`).
+const EVMGIF_JUMPDEST: u8 = 0x5b;
+
+/// EVM opcode for `POP`. Used to consume the size byte that `PUSH1` pushed at
+/// the start of each non-initial chunk header.
+const EVMGIF_POP: u8 = 0x50;
+
+/// EVM opcode for `PUSH1`. Wraps the size byte in every non-initial chunk
+/// header so executing the header is a no-op for the EVM.
+const EVMGIF_PUSH1: u8 = 0x60;
+
+/// Maximum number of user-code bytes that may live between two consecutive
+/// chunk headers (or between the final header and end-of-output). Combined
+/// with the 3-byte header this keeps the inter-header span at most 256 bytes,
+/// per the `--evmgif` spec.
+const EVMGIF_MAX_CHUNK_CONTENT: usize = 253;
 
 /// An item to be assembled, which can be either an [`AbstractOp`],
 /// the inclusion of a new scope or a raw byte sequence.
@@ -219,6 +282,33 @@ pub struct Assembler {
 
     /// Pushes that are variable-sized and need to be backpatched.
     variable_sized_push: Vec<PushDef>,
+
+    /// When set, run the `--evmgif` post-pass over the assembled output:
+    /// insert chunk-size headers (so the bytecode is also a valid GIF
+    /// sub-block stream) and resolve every label-bearing push as
+    /// `chunked_position + offset` instead of `position`.
+    evmgif_offset: Option<u64>,
+
+    /// Filled during emission only when [`Self::evmgif_offset`] is set:
+    /// every push whose immediate references a label, so the evmgif
+    /// post-pass can rewrite its bytes once the chunk layout is known.
+    evmgif_label_pushes: Vec<EvmGifPushRef>,
+}
+
+/// Bookkeeping for a single label-bearing push, captured during emission
+/// when `--evmgif` is active. Holds enough state to re-evaluate the push
+/// expression against the chunked label positions and write the new bytes
+/// in-place.
+#[derive(Debug, Clone)]
+struct EvmGifPushRef {
+    /// Byte offset of the push opcode in the *unchunked* output.
+    unchunked_op_pos: usize,
+
+    /// Width of the push immediate (i.e. `push_size - 1`; 1 for `PUSH1`).
+    imm_size: usize,
+
+    /// Expression to re-evaluate against the chunked label positions.
+    expr: Expression,
 }
 
 /// A label definition.
@@ -267,10 +357,193 @@ impl PushDef {
     }
 }
 
+/// Boundaries computed by [`plan_chunks`] — one entry per chunk header that
+/// will appear in the chunked output, plus the position where output ends so
+/// we can compute the size of the last chunk uniformly.
+#[derive(Debug)]
+struct ChunkBoundaries {
+    /// Byte offsets in the *unchunked* output where each chunk's user-code
+    /// content starts. `header_at[0] == 1` (right after the leading
+    /// JUMPDEST), and the slice is non-empty because the leading JUMPDEST is
+    /// always absorbed into the first header.
+    header_at: Vec<usize>,
+    /// Total length of the unchunked output. Used as a sentinel "end" so
+    /// `header_at` and `unchunked_len` together describe every chunk's
+    /// `[start, end)` half-open range.
+    unchunked_len: usize,
+}
+
+/// Walk `bytes` opcode-by-opcode and return the starting offset of every
+/// instruction. Unknown opcodes (e.g. raw bytes from `%include_hex`) are
+/// treated as single-byte `InvalidXX` ops, which is the existing
+/// disassembler's contract.
+fn decode_instruction_starts(bytes: &[u8]) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        starts.push(i);
+        let size = Op::<()>::from(bytes[i]).size();
+        // A push whose immediate runs past the end of the buffer cannot
+        // happen for valid assembler output, but be defensive in case
+        // %include_hex produced an unaligned tail.
+        i = i.saturating_add(size).min(bytes.len());
+    }
+    starts
+}
+
+/// Decide where to insert chunk headers. The first instruction (always
+/// JUMPDEST, checked by the caller) is absorbed into the first header. After
+/// that, instructions are packed into chunks of at most
+/// [`EVMGIF_MAX_CHUNK_CONTENT`] bytes each, never splitting an instruction.
+///
+/// Returns one [`ChunkBoundaries::header_at`] entry per chunk; `header_at[0]`
+/// is always `1` (the first chunk's user content starts right after the
+/// leading JUMPDEST).
+fn plan_chunks(instr_starts: &[usize], unchunked_len: usize) -> ChunkBoundaries {
+    let mut header_at = vec![1usize];
+
+    if instr_starts.len() <= 1 {
+        return ChunkBoundaries {
+            header_at,
+            unchunked_len,
+        };
+    }
+
+    let mut current_chunk_start = 1usize;
+
+    // Walk instructions after the leading JUMPDEST (index 0). For each one,
+    // either it fits in the current chunk or it starts a new one.
+    for idx in 1..instr_starts.len() {
+        let instr_start = instr_starts[idx];
+        let instr_end = if idx + 1 < instr_starts.len() {
+            instr_starts[idx + 1]
+        } else {
+            unchunked_len
+        };
+        let instr_size = instr_end - instr_start;
+
+        // If a single instruction is wider than the chunk budget there is
+        // nothing we can do — we can't split it. Bail by giving it its own
+        // chunk; the resulting size byte will overflow and the caller will
+        // see EvmGifPushOverflow further down (or, for non-push wide ops,
+        // produce an oversized size byte which we cap below).
+        if instr_size > EVMGIF_MAX_CHUNK_CONTENT {
+            if current_chunk_start != instr_start {
+                header_at.push(instr_start);
+            }
+            current_chunk_start = instr_start;
+            // Force the next instruction (if any) into a fresh chunk too.
+            continue;
+        }
+
+        let bytes_in_current = instr_end - current_chunk_start;
+        if bytes_in_current > EVMGIF_MAX_CHUNK_CONTENT {
+            header_at.push(instr_start);
+            current_chunk_start = instr_start;
+        }
+    }
+
+    ChunkBoundaries {
+        header_at,
+        unchunked_len,
+    }
+}
+
+/// Build a lookup from unchunked offsets to chunked offsets. Only positions
+/// that can appear in a label or push (instruction starts plus the leading
+/// JUMPDEST at 0) are entered, since intermediate bytes never appear in any
+/// resolved expression.
+fn build_position_map(
+    instr_starts: &[usize],
+    boundaries: &ChunkBoundaries,
+) -> HashMap<usize, usize> {
+    let mut map = HashMap::new();
+    // The leading JUMPDEST stays at chunked offset 1 (right after the
+    // initial <size> byte, before the inserted POP).
+    map.insert(0, 1);
+
+    // Every other byte sits past two header bytes that don't exist in the
+    // unchunked layout (`<size>` and the POP after the JUMPDEST), plus three
+    // bytes for each non-initial header that precedes it.
+    let mut chunk_idx = 0usize;
+    for &start in instr_starts.iter().skip(1) {
+        while chunk_idx + 1 < boundaries.header_at.len()
+            && start >= boundaries.header_at[chunk_idx + 1]
+        {
+            chunk_idx += 1;
+        }
+        let shift = 2 + 3 * chunk_idx;
+        map.insert(start, start + shift);
+    }
+    map
+}
+
+/// Construct the chunked output: leading `<size_0> JUMPDEST POP`, then each
+/// chunk's user bytes preceded (for chunks ≥ 1) by `PUSH1 <size_N> POP`.
+fn assemble_chunked(unchunked: &[u8], boundaries: &ChunkBoundaries) -> Vec<u8> {
+    let headers = &boundaries.header_at;
+    let mut out = Vec::with_capacity(unchunked.len() + 3 * headers.len());
+
+    // Compute each chunk's `[start, end)` range in unchunked space so we can
+    // size the headers in one pass.
+    let chunk_end = |idx: usize| -> usize {
+        if idx + 1 < headers.len() {
+            headers[idx + 1]
+        } else {
+            boundaries.unchunked_len
+        }
+    };
+
+    for (idx, &chunk_start) in headers.iter().enumerate() {
+        let end = chunk_end(idx);
+        let content_len = end - chunk_start;
+
+        if idx == 0 {
+            // First header: <size> JUMPDEST POP. The JUMPDEST byte is taken
+            // from the user's first instruction (already validated to be
+            // 0x5b), so we don't copy `unchunked[0]` again into the chunk
+            // body — it lives inside the header.
+            //
+            // `<size>` counts the bytes that follow it before the next
+            // header (or end-of-output): JUMPDEST + POP + content_len.
+            let size = (2 + content_len) as u8;
+            out.push(size);
+            out.push(EVMGIF_JUMPDEST);
+            out.push(EVMGIF_POP);
+        } else {
+            // Subsequent headers: PUSH1 <size> POP. `<size>` counts the
+            // bytes after itself up to the next header (POP + content_len),
+            // which is at most 254 — within byte range.
+            let size = (1 + content_len) as u8;
+            out.push(EVMGIF_PUSH1);
+            out.push(size);
+            out.push(EVMGIF_POP);
+        }
+
+        out.extend_from_slice(&unchunked[chunk_start..end]);
+    }
+
+    out
+}
+
 impl Assembler {
     /// Create a new `Assembler`.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create a new `Assembler` in `--evmgif` mode at the given base offset.
+    ///
+    /// The output is chunked with `<size> JUMPDEST POP` as the first header
+    /// and `PUSH1 <size> POP` between subsequent chunks, and every label
+    /// resolves to `offset + chunked_position`. The first user instruction
+    /// must be `JUMPDEST` — it is absorbed into the first header and used as
+    /// the caller's entry point at `offset + 1`.
+    pub fn with_evmgif_offset(offset: u64) -> Self {
+        Self {
+            evmgif_offset: Some(offset),
+            ..Default::default()
+        }
     }
 
     /// Feed instructions into the `Assembler`.
@@ -479,11 +752,19 @@ impl Assembler {
             Err(value) => return value,
         };
 
+        if self.evmgif_offset.is_some() {
+            return self.evmgif_chunkify(output);
+        }
+
         Ok(output)
     }
 
     fn emit_bytecode(&mut self) -> Result<Vec<u8>, Result<Vec<u8>, Error>> {
         let mut output = Vec::new();
+        let track_evmgif = self.evmgif_offset.is_some();
+        if track_evmgif {
+            self.evmgif_label_pushes.clear();
+        }
         for op in self.ready.iter() {
             let op = match op {
                 RawOp::Op(ref op) => op,
@@ -494,6 +775,24 @@ impl Assembler {
                 RawOp::Scope(_) => unreachable!("scopes should be expanded"),
             };
 
+            // In evmgif mode, capture the expression of any push that
+            // references at least one label, *before* we concretize and
+            // throw away the abstract form. The position is recorded
+            // post-emit so we know exactly where the immediate landed.
+            let push_with_labels = if track_evmgif {
+                op.expr().and_then(|expr| {
+                    let labels = expr.labels(&self.declared_macros).ok()?;
+                    if labels.is_empty() {
+                        None
+                    } else {
+                        Some(expr.clone())
+                    }
+                })
+            } else {
+                None
+            };
+
+            let pre_len = output.len();
             match op
                 .clone()
                 .concretize((&self.declared_labels, &self.declared_macros).into())
@@ -519,8 +818,134 @@ impl Assembler {
                 }
                 Err(_) => unreachable!("all ops should be concretizable"),
             }
+
+            if let Some(expr) = push_with_labels {
+                let emitted = output.len() - pre_len;
+                debug_assert!(emitted >= 2, "label-bearing push must emit opcode + immediate");
+                self.evmgif_label_pushes.push(EvmGifPushRef {
+                    unchunked_op_pos: pre_len,
+                    imm_size: emitted - 1,
+                    expr,
+                });
+            }
         }
         Ok(output)
+    }
+
+    /// Transform the just-emitted unchunked bytecode into the `--evmgif`
+    /// layout:
+    ///
+    /// ```text
+    /// <size_0> JUMPDEST POP <chunk_0 user bytes ...>
+    /// PUSH1 <size_1> POP <chunk_1 user bytes ...>
+    /// PUSH1 <size_2> POP <chunk_2 user bytes ...>
+    /// ...
+    /// ```
+    ///
+    /// Each `<size_N>` byte stores the number of bytes that follow it up to
+    /// the next header (or end-of-output). The first header omits `PUSH1`
+    /// because the caller jumps directly to the `JUMPDEST` at `offset + 1`,
+    /// so the leading `<size_0>` byte is never executed linearly.
+    ///
+    /// Labels resolve to `offset + chunked_position`, so every push captured
+    /// in [`Self::evmgif_label_pushes`] is rewritten in place. Pushes whose
+    /// new value would not fit their original immediate width produce an
+    /// [`Error::EvmGifPushOverflow`]; the caller can switch to `%push` or a
+    /// larger `pushN` to give the assembler room.
+    fn evmgif_chunkify(&mut self, unchunked: Vec<u8>) -> Result<Vec<u8>, Error> {
+        let offset = self
+            .evmgif_offset
+            .expect("evmgif_chunkify called without evmgif_offset");
+
+        // The caller jumps to `offset + 1`, expecting a `JUMPDEST` there. The
+        // only byte we can position at offset+1 without disturbing the user's
+        // code is the user's first instruction, so it must be a JUMPDEST.
+        let first = unchunked.first().copied();
+        if first != Some(EVMGIF_JUMPDEST) {
+            return error::EvmGifFirstNotJumpdest { actual: first }.fail();
+        }
+
+        // 1. Walk instructions to find their starting offsets. The output is
+        // EVM bytecode, so `Op::<()>::from(byte).size()` gives the encoded
+        // width of each instruction (1 + immediate bytes, including for
+        // pushes). Every byte is some opcode (unknowns become `InvalidXX`
+        // with size 1), so this never fails mid-stream — it just consumes
+        // raw `%include_hex` bytes opcode-by-opcode, which is acceptable.
+        let instr_starts = decode_instruction_starts(&unchunked);
+
+        // 2. Partition instructions after the leading JUMPDEST into chunks.
+        // The leading JUMPDEST is absorbed into the first header — chunk 0's
+        // content therefore starts at instruction index 1.
+        let chunk_boundaries = plan_chunks(&instr_starts, unchunked.len());
+
+        // 3. Build the mapping `unchunked offset -> chunked offset` for the
+        // pivotal positions we care about: instruction starts and label
+        // positions. Non-instruction offsets inside a multi-byte push never
+        // appear in a label, so we only need to handle starts.
+        let position_map = build_position_map(&instr_starts, &chunk_boundaries);
+
+        // 4. Build the chunked output, copying user bytes verbatim and
+        // inserting headers at chunk boundaries.
+        let chunked = assemble_chunked(&unchunked, &chunk_boundaries);
+
+        // 5. Update declared labels to their chunked + offset positions so
+        // we can re-evaluate the expressions of label-bearing pushes.
+        for value in self.declared_labels.values_mut() {
+            if let Some(ref mut def) = value {
+                let chunked_pos = position_map
+                    .get(&def.position)
+                    .copied()
+                    .expect("label position must be an instruction boundary");
+                def.position = chunked_pos + offset as usize;
+                def.updated = true;
+            }
+        }
+
+        // 6. Re-evaluate each tracked label-push and rewrite the immediate
+        // in place. The push's chunked location comes from the same mapping
+        // we built for labels — every push opcode sits at an instruction
+        // boundary by construction.
+        let mut chunked = chunked;
+        for push in self.evmgif_label_pushes.drain(..) {
+            let chunked_op_pos = position_map
+                .get(&push.unchunked_op_pos)
+                .copied()
+                .expect("push opcode must land on an instruction boundary");
+            let imm_start = chunked_op_pos + 1;
+            let imm_end = imm_start + push.imm_size;
+
+            let value = push
+                .expr
+                .eval_with_context((&self.declared_labels, &self.declared_macros).into())
+                .expect("labels resolved during emit must still resolve");
+
+            let (sign, bytes) = value.to_bytes_be();
+            if sign == Sign::Minus {
+                // Original emit already rejects negative pushes; re-add
+                // `offset` (which is non-negative) cannot introduce one.
+                unreachable!("evmgif label push evaluated negative");
+            }
+
+            if bytes.len() > push.imm_size {
+                return error::EvmGifPushOverflow {
+                    expr: push.expr.clone(),
+                    value,
+                    push_size: push.imm_size,
+                }
+                .fail();
+            }
+
+            // Big-endian, right-justified into the immediate slot. The slot
+            // was already zeroed during the initial emit, but we overwrite
+            // the leading zeros too in case the value shrank to fewer bytes.
+            let pad = push.imm_size - bytes.len();
+            for b in chunked[imm_start..imm_start + pad].iter_mut() {
+                *b = 0;
+            }
+            chunked[imm_start + pad..imm_end].copy_from_slice(&bytes);
+        }
+
+        Ok(chunked)
     }
 
     fn declare_label(&mut self, rop: &RawOp) -> Result<(), Error> {
@@ -1503,6 +1928,153 @@ mod tests {
         assert_eq!(result, hex!("58335b"));
 
         Ok(())
+    }
+
+    // ---------- --evmgif tests ----------
+
+    #[test]
+    fn evmgif_rejects_non_jumpdest_start() {
+        let mut asm = Assembler::with_evmgif_offset(0);
+        // First op is GetPc, not JumpDest -> should fail.
+        let ops = vec![AbstractOp::new(GetPc), AbstractOp::new(JumpDest)];
+        let err = asm.assemble(&ops).unwrap_err();
+        assert_matches!(
+            err,
+            Error::EvmGifFirstNotJumpdest { actual: Some(0x58), .. }
+        );
+    }
+
+    #[test]
+    fn evmgif_rejects_empty_program() {
+        let mut asm = Assembler::with_evmgif_offset(0);
+        let ops: Vec<AbstractOp> = vec![];
+        let err = asm.assemble(&ops).unwrap_err();
+        assert_matches!(err, Error::EvmGifFirstNotJumpdest { actual: None, .. });
+    }
+
+    #[test]
+    fn evmgif_smallest_program_just_jumpdest() -> Result<(), Error> {
+        // The leading JUMPDEST is absorbed into the first header. With no
+        // other instructions chunk 0 has zero content, so:
+        //   size_0 = 2 (JUMPDEST + POP that follow it)
+        let mut asm = Assembler::with_evmgif_offset(0);
+        let ops = vec![AbstractOp::new(JumpDest)];
+        let result = asm.assemble(&ops)?;
+        assert_eq!(result, hex!("025b50"));
+        Ok(())
+    }
+
+    #[test]
+    fn evmgif_short_program_offset_zero() -> Result<(), Error> {
+        // Layout:
+        //   <size_0=4> JUMPDEST POP GAS STOP
+        // size_0 counts JUMPDEST + POP + GAS + STOP = 4 bytes.
+        let mut asm = Assembler::with_evmgif_offset(0);
+        let ops = vec![
+            AbstractOp::new(JumpDest),
+            AbstractOp::new(Gas),
+            AbstractOp::new(Stop),
+        ];
+        let result = asm.assemble(&ops)?;
+        assert_eq!(result, hex!("045b505a00"));
+        Ok(())
+    }
+
+    #[test]
+    fn evmgif_label_push_picks_up_offset() -> Result<(), Error> {
+        // Label `dest` lives right after the leading JUMPDEST in the
+        // unchunked stream, so unchunked_pos = 1, chunked_pos = 3.
+        // With offset 0x10 the pushed value is 0x13.
+        let mut asm = Assembler::with_evmgif_offset(0x10);
+        let ops = vec![
+            AbstractOp::new(JumpDest),
+            AbstractOp::Label("dest".into()),
+            AbstractOp::new(JumpDest),
+            AbstractOp::new(Push1(Imm::with_label("dest"))),
+            AbstractOp::new(Jump),
+        ];
+        let result = asm.assemble(&ops)?;
+        // <size=6> JUMPDEST POP | JUMPDEST(dest) PUSH1 0x13 JUMP
+        assert_eq!(result, hex!("065b50") /* header */ .iter()
+            .chain(hex!("5b601356").iter())
+            .copied()
+            .collect::<Vec<_>>());
+        Ok(())
+    }
+
+    #[test]
+    fn evmgif_inserts_chunk_header_when_content_exceeds_limit() -> Result<(), Error> {
+        // 1 JUMPDEST + 254 GAS ops in the unchunked stream. Chunk 0 can hold
+        // at most 253 bytes of user content; instruction #254 spills into
+        // chunk 1.
+        let mut ops: Vec<AbstractOp> = Vec::with_capacity(255);
+        ops.push(AbstractOp::new(JumpDest));
+        for _ in 0..254 {
+            ops.push(AbstractOp::new(Gas));
+        }
+        let mut asm = Assembler::with_evmgif_offset(0);
+        let result = asm.assemble(&ops)?;
+
+        // Header 0: <size_0 = 2 + 253 = 255> JUMPDEST POP
+        // Chunk 0 content: 253 GAS bytes.
+        // Header 1: PUSH1 <size_1 = 1 + 1 = 2> POP
+        // Chunk 1 content: 1 GAS byte.
+        let mut expected = vec![255u8, EVMGIF_JUMPDEST, EVMGIF_POP];
+        expected.extend(std::iter::repeat(0x5a).take(253));
+        expected.extend_from_slice(&[EVMGIF_PUSH1, 0x02, EVMGIF_POP]);
+        expected.push(0x5a);
+        assert_eq!(result, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn evmgif_label_in_second_chunk_picks_up_chunk_shift() -> Result<(), Error> {
+        // The label lands inside the second chunk, so the pushed value
+        // includes both the +2 prefix shift and the +3 second-chunk header.
+        // With offset 0, the chunked position of `dest` is:
+        //   unchunked_pos(dest) + 2 + 3 = (1 + 253) + 5 = 259
+        let mut ops: Vec<AbstractOp> = Vec::new();
+        ops.push(AbstractOp::new(JumpDest));
+        for _ in 0..253 {
+            ops.push(AbstractOp::new(Gas));
+        }
+        ops.push(AbstractOp::Label("dest".into()));
+        ops.push(AbstractOp::new(JumpDest));
+        ops.push(AbstractOp::new(Push2(Imm::with_label("dest"))));
+
+        let mut asm = Assembler::with_evmgif_offset(0);
+        let result = asm.assemble(&ops)?;
+
+        // Verify the PUSH2 immediate at the end carries 0x0103 (= 259).
+        // PUSH2 is at chunked position: unchunked(255) + 2 + 3 = 260; the
+        // immediate occupies bytes 261..263 of the chunked output.
+        assert_eq!(result[261], 0x01);
+        assert_eq!(result[262], 0x03);
+
+        // Sanity-check chunk 1 header sits in the right place:
+        // chunk 0 spans bytes 3..256 of output; header 1 at 256..259.
+        assert_eq!(result[256], EVMGIF_PUSH1);
+        // size_1 = 1 (POP) + (final chunk content length)
+        // chunk 1 content = JUMPDEST(dest) + PUSH2 + 2 bytes = 4
+        assert_eq!(result[257], 0x05);
+        assert_eq!(result[258], EVMGIF_POP);
+        Ok(())
+    }
+
+    #[test]
+    fn evmgif_push_overflow_when_value_outgrows_immediate() {
+        // PUSH1 referencing a label whose chunked + offset position exceeds
+        // 255 must fail with EvmGifPushOverflow rather than silently
+        // truncating.
+        let mut asm = Assembler::with_evmgif_offset(0xff00);
+        let ops = vec![
+            AbstractOp::new(JumpDest),
+            AbstractOp::new(Push1(Imm::with_label("self_ref"))),
+            AbstractOp::Label("self_ref".into()),
+            AbstractOp::new(JumpDest),
+        ];
+        let err = asm.assemble(&ops).unwrap_err();
+        assert_matches!(err, Error::EvmGifPushOverflow { push_size: 1, .. });
     }
 
     #[test]
