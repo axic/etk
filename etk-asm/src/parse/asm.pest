@@ -3,7 +3,7 @@
 ///////////////////////
 program = _{ SOI ~ inner ~ EOI }
 inner = _{ NEWLINE* ~ (stmt ~ (NEWLINE+|";"))* ~ stmt? }
-stmt = _{ label_definition | builtin | local_macro | push | op }
+stmt = _{ label_definition | builtin | local_macro | push | raw_value | op }
 
 //////////////////////
 // opcode mnemonics //
@@ -31,11 +31,14 @@ log = @{ "log" ~ '0'..'4' }
 word_size = @{ ('1'..'2' ~ '0'..'9') | ("3" ~ '0'..'2') | '1'..'9' }
 half_word_size = @{ ("1" ~ '0'..'6') | '1'..'9' }
 
+raw_value = ${ ".bytes" ~ raw_size ~ WHITESPACE ~ expression }
+raw_size = @{ "8" | "4" | "2" | "1" }
+
 ////////////////////////
 // instruction macros //
 ////////////////////////
 instruction_macro_definition = { "%macro" ~ function_declaration ~ NEWLINE* ~ (instruction_macro_stmt ~ NEWLINE+)* ~ "%end" }
-instruction_macro_stmt = _{ label_definition | "%" ~ push_macro | local_macro | push | op }
+instruction_macro_stmt = _{ label_definition | "%" ~ push_macro | local_macro | push | raw_value | op }
 instruction_macro_variable = @{ "$" ~ function_parameter }
 instruction_macro = !{ "%" ~ function_invocation }
 

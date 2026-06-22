@@ -180,6 +180,17 @@ pub enum AbstractOp {
     /// A variable sized push, which is a virtual instruction.
     Push(Imm),
 
+    /// A raw, fixed-width data directive (`.bytes1`, `.bytes2`, `.bytes4`,
+    /// `.bytes8`). Emits exactly `size` bytes, big-endian, left-padded with
+    /// zeros. No opcode is emitted.
+    RawBytes {
+        /// Width of the emitted value in bytes.
+        size: usize,
+
+        /// The expression to evaluate and emit.
+        imm: Imm,
+    },
+
     /// A user-defined macro definition, which is a virtual instruction.
     MacroDefinition(MacroDefinition),
 
@@ -229,6 +240,7 @@ impl AbstractOp {
                 let start = bytes.len() + 1 - spec.size();
                 AbstractOp::new(spec.with(&bytes[start..]).unwrap()).concretize(ctx)
             }
+            Self::RawBytes { .. } => panic!("raw bytes cannot be concretized to an Op"),
             Self::Label(_) => panic!("labels cannot be concretized"),
             Self::Macro(_) => panic!("macros cannot be concretized"),
             Self::MacroDefinition(_) => panic!("macro definitions cannot be concretized"),
@@ -240,6 +252,10 @@ impl AbstractOp {
         match self {
             Self::Op(op) => op.expr(),
             Self::Push(Imm { tree, .. }) => Some(tree),
+            Self::RawBytes {
+                imm: Imm { tree, .. },
+                ..
+            } => Some(tree),
             _ => None,
         }
     }
@@ -249,6 +265,10 @@ impl AbstractOp {
         match self {
             Self::Op(op) => op.expr_mut(),
             Self::Push(Imm { tree, .. }) => Some(tree),
+            Self::RawBytes {
+                imm: Imm { tree, .. },
+                ..
+            } => Some(tree),
             _ => None,
         }
     }
@@ -263,6 +283,7 @@ impl AbstractOp {
             Self::Op(op) => Some(op.size()),
             Self::Label(_) => Some(0),
             Self::Push(_) => None,
+            Self::RawBytes { size, .. } => Some(*size),
             Self::Macro(_) => None,
             Self::MacroDefinition(_) => None,
         }
@@ -311,6 +332,7 @@ impl fmt::Display for AbstractOp {
                 Ok(())
             }
             Self::Push(txt) => write!(f, r#"%push({})"#, txt),
+            Self::RawBytes { size, imm } => write!(f, ".bytes{} {}", size, imm),
             Self::Label(lbl) => write!(f, r#"{}:"#, lbl),
             Self::Macro(m) => write!(f, "{}", m),
             Self::MacroDefinition(defn) => write!(f, "{}", defn),

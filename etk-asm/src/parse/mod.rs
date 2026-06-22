@@ -26,6 +26,29 @@ use etk_ops::cancun::Op;
 use num_bigint::BigInt;
 use pest::{iterators::Pair, Parser};
 
+pub(crate) fn parse_raw_value(pair: Pair<Rule>) -> Result<AbstractOp, ParseError> {
+    let mut pair = pair.into_inner();
+    let size = pair.next().unwrap();
+    let size: usize = size.as_str().parse().unwrap();
+    let operand = pair.next().unwrap();
+
+    let expr = expression::parse(operand)?;
+
+    if let Ok(val) = expr.eval() {
+        if val.sign() != num_bigint::Sign::Minus {
+            let max = BigInt::pow(&BigInt::from(2u32), (8 * size).try_into().unwrap());
+            if val >= max {
+                return error::ImmediateTooLarge.fail();
+            }
+        }
+    }
+
+    Ok(AbstractOp::RawBytes {
+        size,
+        imm: expr.into(),
+    })
+}
+
 pub(crate) fn parse_asm(asm: &str) -> Result<Vec<Node>, ParseError> {
     let mut program: Vec<Node> = Vec::new();
 
@@ -49,6 +72,7 @@ fn parse_abstract_op(pair: Pair<Rule>) -> Result<AbstractOp, ParseError> {
             AbstractOp::Label(pair.into_inner().next().unwrap().as_str().to_string())
         }
         Rule::push => parse_push(pair)?,
+        Rule::raw_value => parse_raw_value(pair)?,
         Rule::op => {
             let spec: Op<()> = pair.as_str().parse().unwrap();
             let op = Op::new(spec).unwrap();
@@ -201,6 +225,61 @@ mod tests {
 
         let asm = "push1 256";
         assert_matches!(parse_asm(asm), Err(ParseError::ImmediateTooLarge { .. }));
+    }
+
+    #[test]
+    fn parse_raw_bytes_literal() {
+        let asm = r#"
+            .bytes1 0x12
+            .bytes2 0x1234
+            .bytes4 0x12345678
+            .bytes8 0x1234567812345678
+            .bytes2 0x12
+        "#;
+        let expected = nodes![
+            AbstractOp::RawBytes {
+                size: 1,
+                imm: Imm::from(hex!("12"))
+            },
+            AbstractOp::RawBytes {
+                size: 2,
+                imm: Imm::from(hex!("1234"))
+            },
+            AbstractOp::RawBytes {
+                size: 4,
+                imm: Imm::from(hex!("12345678"))
+            },
+            AbstractOp::RawBytes {
+                size: 8,
+                imm: Imm::from(hex!("1234567812345678"))
+            },
+            AbstractOp::RawBytes {
+                size: 2,
+                imm: Imm::from(hex!("12"))
+            },
+        ];
+        assert_matches!(parse_asm(asm), Ok(e) if e == expected);
+
+        let asm = ".bytes1 0x1234";
+        assert_matches!(parse_asm(asm), Err(ParseError::ImmediateTooLarge { .. }));
+    }
+
+    #[test]
+    fn parse_raw_bytes_label() {
+        let asm = r#"
+            target:
+            jumpdest
+            .bytes4 target
+        "#;
+        let expected = nodes![
+            AbstractOp::Label("target".into()),
+            Op::from(JumpDest),
+            AbstractOp::RawBytes {
+                size: 4,
+                imm: Imm::with_label("target"),
+            },
+        ];
+        assert_matches!(parse_asm(asm), Ok(e) if e == expected);
     }
 
     #[test]

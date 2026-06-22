@@ -76,6 +76,23 @@ mod error {
             backtrace: Backtrace,
         },
 
+        /// A raw value directive was given a value too large for its width.
+        #[snafu(display("the expression `{}={}` does not fit in .bytes{}", expr, value, size))]
+        #[non_exhaustive]
+        RawBytesTooLarge {
+            /// The oversized expression.
+            expr: Expression,
+
+            /// The evaluated value of the expression.
+            value: BigInt,
+
+            /// The width, in bytes, of the directive.
+            size: usize,
+
+            /// The location of the error.
+            backtrace: Backtrace,
+        },
+
         /// The value provided to an unsized push (`%push`) was too large.
         #[snafu(display("value was too large for any push"))]
         #[non_exhaustive]
@@ -343,6 +360,48 @@ impl Assembler {
             RawOp::Op(AbstractOp::Macro(ref m)) => {
                 self.expand_macro(&m.name, &m.parameters)?;
             }
+            RawOp::Op(AbstractOp::RawBytes { ref size, ref imm }) => {
+                let ctx = (&self.declared_labels, &self.declared_macros).into();
+                match imm.tree.eval_with_context(ctx) {
+                    Ok(value) => {
+                        if value.sign() == num_bigint::Sign::Minus {
+                            return error::ExpressionNegative {
+                                expr: imm.tree.clone(),
+                                value,
+                            }
+                            .fail();
+                        }
+                        let (_, bytes) = value.to_bytes_be();
+                        if bytes.len() > *size {
+                            return error::RawBytesTooLarge {
+                                expr: imm.tree.clone(),
+                                value,
+                                size: *size,
+                            }
+                            .fail();
+                        }
+                        self.concrete_len += *size;
+                        self.ready.push(rop.clone());
+                    }
+                    Err(UnknownLabel { .. }) => {
+                        let labels = imm
+                            .tree
+                            .labels(&self.declared_macros)
+                            .unwrap()
+                            .into_iter()
+                            .collect::<Vec<String>>();
+                        self.concrete_len += *size;
+                        self.undeclared_labels.extend(labels);
+                        self.ready.push(rop.clone());
+                    }
+                    Err(UnknownMacro { name, .. }) => {
+                        return error::UndeclaredInstructionMacro { name }.fail()
+                    }
+                    Err(UndefinedVariable { name, .. }) => {
+                        return error::UndeclaredVariableMacro { var: name }.fail()
+                    }
+                }
+            }
             RawOp::Op(ref op) => {
                 match op
                     .clone()
@@ -486,6 +545,48 @@ impl Assembler {
         let mut output = Vec::new();
         for op in self.ready.iter() {
             let op = match op {
+                RawOp::Op(AbstractOp::RawBytes { size, imm }) => {
+                    let ctx = (&self.declared_labels, &self.declared_macros).into();
+                    match imm.tree.eval_with_context(ctx) {
+                        Ok(value) => {
+                            if value.sign() == num_bigint::Sign::Minus {
+                                return Err(error::ExpressionNegative {
+                                    expr: imm.tree.clone(),
+                                    value,
+                                }
+                                .fail());
+                            }
+                            let (_, mut bytes) = value.to_bytes_be();
+                            if bytes.len() > *size {
+                                return Err(error::RawBytesTooLarge {
+                                    expr: imm.tree.clone(),
+                                    value,
+                                    size: *size,
+                                }
+                                .fail());
+                            }
+                            if bytes.len() < *size {
+                                let mut padded = vec![0u8; *size - bytes.len()];
+                                padded.append(&mut bytes);
+                                bytes = padded;
+                            }
+                            output.extend(bytes);
+                            continue;
+                        }
+                        Err(UnknownLabel { .. }) => {
+                            return Err(error::UndeclaredLabels {
+                                labels: self.undeclared_labels.iter().cloned().collect::<Vec<_>>(),
+                            }
+                            .fail());
+                        }
+                        Err(UnknownMacro { name, .. }) => {
+                            return Err(error::UndeclaredInstructionMacro { name }.fail());
+                        }
+                        Err(UndefinedVariable { name, .. }) => {
+                            return Err(error::UndeclaredVariableMacro { var: name }.fail());
+                        }
+                    }
+                }
                 RawOp::Op(ref op) => op,
                 RawOp::Raw(raw) => {
                     output.extend(raw);
@@ -1502,6 +1603,108 @@ mod tests {
         let result = asm.assemble(&ops)?;
         assert_eq!(result, hex!("58335b"));
 
+        Ok(())
+    }
+
+    #[test]
+    fn assemble_raw_bytes_literal() -> Result<(), Error> {
+        let mut asm = Assembler::new();
+        let code = vec![
+            AbstractOp::RawBytes {
+                size: 1,
+                imm: Imm::from(hex!("12")),
+            },
+            AbstractOp::RawBytes {
+                size: 2,
+                imm: Imm::from(hex!("1234")),
+            },
+            AbstractOp::RawBytes {
+                size: 4,
+                imm: Imm::from(hex!("12345678")),
+            },
+            AbstractOp::RawBytes {
+                size: 8,
+                imm: Imm::from(hex!("1234567812345678")),
+            },
+        ];
+        let result = asm.assemble(&code)?;
+        assert_eq!(result, hex!("121234123456781234567812345678"));
+        Ok(())
+    }
+
+    #[test]
+    fn assemble_raw_bytes_left_pads_with_zeros() -> Result<(), Error> {
+        let mut asm = Assembler::new();
+        let code = vec![
+            AbstractOp::RawBytes {
+                size: 4,
+                imm: Imm::from(hex!("12")),
+            },
+            AbstractOp::RawBytes {
+                size: 8,
+                imm: Imm::from(0u8),
+            },
+        ];
+        let result = asm.assemble(&code)?;
+        assert_eq!(result, hex!("000000120000000000000000"));
+        Ok(())
+    }
+
+    #[test]
+    fn assemble_raw_bytes_too_large() {
+        let mut asm = Assembler::new();
+        let code = vec![AbstractOp::RawBytes {
+            size: 2,
+            imm: Imm::from(hex!("010203")),
+        }];
+        let err = asm.assemble(&code).unwrap_err();
+        assert_matches!(err, Error::RawBytesTooLarge { size: 2, .. });
+    }
+
+    #[test]
+    fn assemble_raw_bytes_negative() {
+        let mut asm = Assembler::new();
+        let code = vec![AbstractOp::RawBytes {
+            size: 4,
+            imm: Imm::with_expression(BigInt::from(-1).into()),
+        }];
+        let err = asm.assemble(&code).unwrap_err();
+        assert_matches!(err, Error::ExpressionNegative { .. });
+    }
+
+    #[test]
+    fn assemble_raw_bytes_label_forward() -> Result<(), Error> {
+        let mut asm = Assembler::new();
+        let code = vec![
+            AbstractOp::new(JumpDest),
+            AbstractOp::RawBytes {
+                size: 4,
+                imm: Imm::with_label("target"),
+            },
+            AbstractOp::Label("target".into()),
+            AbstractOp::new(JumpDest),
+        ];
+        let result = asm.assemble(&code)?;
+        // jumpdest (1) + 4 bytes of target (=5) + jumpdest
+        assert_eq!(result, hex!("5b000000055b"));
+        Ok(())
+    }
+
+    #[test]
+    fn assemble_raw_bytes_label_after_variable_push() -> Result<(), Error> {
+        let mut asm = Assembler::new();
+        let code = vec![
+            AbstractOp::Push(Imm::with_label("target")),
+            AbstractOp::RawBytes {
+                size: 2,
+                imm: Imm::with_label("target"),
+            },
+            AbstractOp::Label("target".into()),
+            AbstractOp::new(JumpDest),
+        ];
+        let result = asm.assemble(&code)?;
+        // push1 0x04 (2 bytes) + .bytes2 0x0004 (2 bytes) + jumpdest
+        assert_eq!(result, hex!("600400045b"));
         Ok(())
     }
 

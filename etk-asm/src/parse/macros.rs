@@ -67,6 +67,8 @@ fn parse_instruction_macro_defn(pair: Pair<Rule>) -> Result<AbstractOp, ParseErr
         if pair.as_rule() == Rule::push_macro {
             let expr = expression::parse(pair.into_inner().next().unwrap())?;
             contents.push(AbstractOp::Push(expr.into()));
+        } else if pair.as_rule() == Rule::raw_value {
+            contents.push(super::parse_raw_value(pair)?);
         } else {
             contents.push(super::parse_abstract_op(pair)?);
         }

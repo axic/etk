@@ -37,6 +37,20 @@ fn simple_constructor() -> Result<(), Error> {
 }
 
 #[test]
+fn raw_bytes() -> Result<(), Error> {
+    let mut output = Vec::new();
+    let mut ingester = Ingest::new(&mut output);
+    ingester.ingest_file(source(&["raw-bytes", "main.etk"]))?;
+
+    assert_eq!(
+        output,
+        hex!("6000121234123456781234567812345678000000425b0015"),
+    );
+
+    Ok(())
+}
+
+#[test]
 fn out_of_bounds() {
     let mut output = Vec::new();
     let mut ingester = Ingest::new(&mut output);

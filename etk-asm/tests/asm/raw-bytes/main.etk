@@ -1,0 +1,12 @@
+# Raw value directives (.bytes1/2/4/8) inline data alongside opcodes.
+push1 0x00
+.bytes1 0x12
+.bytes2 0x1234
+.bytes4 0x12345678
+.bytes8 0x1234567812345678
+# left-pad: 0x42 in 4 bytes
+.bytes4 0x42
+# label reference
+target:
+jumpdest
+.bytes2 target
