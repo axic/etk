@@ -24,6 +24,7 @@ use crate::ast::Node;
 use crate::ops::AbstractOp;
 use etk_ops::cancun::Op;
 use num_bigint::BigInt;
+use num_traits::ToPrimitive;
 use pest::{iterators::Pair, Parser};
 
 pub(crate) fn parse_asm(asm: &str) -> Result<Vec<Node>, ParseError> {
@@ -33,6 +34,7 @@ pub(crate) fn parse_asm(asm: &str) -> Result<Vec<Node>, ParseError> {
     for pair in pairs {
         let node = match pair.as_rule() {
             Rule::builtin => macros::parse_builtin(pair)?,
+            Rule::org_directive => parse_org(pair)?,
             Rule::EOI => continue,
             _ => parse_abstract_op(pair)?.into(),
         };
@@ -40,6 +42,16 @@ pub(crate) fn parse_asm(asm: &str) -> Result<Vec<Node>, ParseError> {
     }
 
     Ok(program)
+}
+
+fn parse_org(pair: Pair<Rule>) -> Result<Node, ParseError> {
+    let number_pair = pair.into_inner().next().unwrap();
+    let expr = expression::parse(number_pair)?;
+    let value = expr.eval().map_err(|_| error::ImmediateTooLarge.build())?;
+    let offset = value
+        .to_usize()
+        .ok_or_else(|| error::ImmediateTooLarge.build())?;
+    Ok(Node::Org(offset))
 }
 
 fn parse_abstract_op(pair: Pair<Rule>) -> Result<AbstractOp, ParseError> {
@@ -381,6 +393,48 @@ mod tests {
             Op::from(Push1(Imm::from(2u8))),
         ];
         assert_matches!(parse_asm(&asm), Ok(e) if e == expected)
+    }
+
+    #[test]
+    fn parse_org_decimal() {
+        let asm = r#"
+            push1 1
+            .org 16
+            push1 2
+        "#;
+        let expected = nodes![
+            Op::from(Push1(Imm::from(1u8))),
+            Node::Org(16),
+            Op::from(Push1(Imm::from(2u8))),
+        ];
+        assert_matches!(parse_asm(asm), Ok(e) if e == expected);
+    }
+
+    #[test]
+    fn parse_org_hex() {
+        let asm = r#"
+            .org 0x100
+            jumpdest
+        "#;
+        let expected = nodes![Node::Org(0x100), Op::from(JumpDest)];
+        assert_matches!(parse_asm(asm), Ok(e) if e == expected);
+    }
+
+    #[test]
+    fn parse_org_multiple() {
+        let asm = r#"
+            .org 0x10
+            push1 1
+            .org 0x20
+            push1 2
+        "#;
+        let expected = nodes![
+            Node::Org(0x10),
+            Op::from(Push1(Imm::from(1u8))),
+            Node::Org(0x20),
+            Op::from(Push1(Imm::from(2u8))),
+        ];
+        assert_matches!(parse_asm(asm), Ok(e) if e == expected);
     }
 
     #[test]

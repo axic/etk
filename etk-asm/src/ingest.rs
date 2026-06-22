@@ -348,6 +348,9 @@ where
 
                     raws.push(RawOp::Raw(raw))
                 }
+                Node::Org(offset) => {
+                    raws.push(RawOp::Org(offset));
+                }
             }
         }
 
@@ -654,6 +657,62 @@ mod tests {
         let err = ingest.ingest(root, &text).unwrap_err();
 
         assert_matches!(err, Error::DirectoryTraversal { .. });
+    }
+
+    #[test]
+    fn ingest_org_directive() -> Result<(), Error> {
+        let (_, root) = new_file("");
+
+        let text = r#"
+            push1 1
+            .org 8
+            jumpdest
+            push1 lbl
+            .org 0x20
+            lbl:
+            jumpdest
+        "#;
+
+        let mut output = Vec::new();
+        let mut ingest = Ingest::new(&mut output);
+        ingest.ingest(root, text)?;
+
+        // [0]: push1 1     -> 60 01           (2 bytes)
+        // pad to 8         -> 00 00 00 00 00 00 (6 bytes)
+        // [8]: jumpdest    -> 5b               (1 byte)
+        // [9]: push1 lbl   -> 60 20            (2 bytes; lbl == 0x20)
+        // pad to 0x20      -> 0x20 - 11 = 21 zero bytes
+        // [0x20]: jumpdest -> 5b
+        let mut expected = vec![0x60, 0x01];
+        expected.extend_from_slice(&[0; 6]);
+        expected.push(0x5b);
+        expected.extend_from_slice(&[0x60, 0x20]);
+        expected.extend_from_slice(&[0; 0x20 - 11]);
+        expected.push(0x5b);
+        assert_eq!(output, expected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn ingest_org_rewind_errors() {
+        let (_, root) = new_file("");
+
+        let text = r#"
+            jumpdest
+            jumpdest
+            .org 1
+        "#;
+
+        let mut output = Vec::new();
+        let mut ingest = Ingest::new(&mut output);
+        let err = ingest.ingest(root, text).unwrap_err();
+        assert_matches!(
+            err,
+            Error::Assemble {
+                source: AsmError::OrgRewind { current: 2, requested: 1, .. }
+            }
+        );
     }
 
     #[test]

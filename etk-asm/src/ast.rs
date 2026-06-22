@@ -9,6 +9,7 @@ pub(crate) enum Node {
     Import(PathBuf),
     Include(PathBuf),
     IncludeHex(PathBuf),
+    Org(usize),
 }
 impl From<Op<Abstract>> for Node {
     fn from(op: Op<Abstract>) -> Self {

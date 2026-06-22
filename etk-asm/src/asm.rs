@@ -137,6 +137,25 @@ mod error {
             /// The location of the error.
             backtrace: Backtrace,
         },
+
+        /// An `.org` directive requested an offset that is before the
+        /// current assembler position.
+        #[snafu(display(
+            "`.org {}` is before the current position ({})",
+            requested,
+            current
+        ))]
+        #[non_exhaustive]
+        OrgRewind {
+            /// The current position when `.org` was encountered.
+            current: usize,
+
+            /// The offset requested by the `.org` directive.
+            requested: usize,
+
+            /// The location of the error.
+            backtrace: Backtrace,
+        },
     }
 }
 
@@ -161,6 +180,11 @@ pub enum RawOp {
     /// Raw bytes, for example from `%include_hex`, to be included verbatim in
     /// the output.
     Raw(Vec<u8>),
+
+    /// Sets the base offset for the code that follows. The assembler pads the
+    /// output with zero bytes from the current position up to the requested
+    /// offset. Going backwards is an error.
+    Org(usize),
 }
 
 impl From<AbstractOp> for RawOp {
@@ -411,6 +435,20 @@ impl Assembler {
                 self.concrete_len += scope_result.len();
                 self.ready.push(RawOp::Raw(scope_result));
             }
+            RawOp::Org(offset) => {
+                if offset < self.concrete_len {
+                    return error::OrgRewind {
+                        current: self.concrete_len,
+                        requested: offset,
+                    }
+                    .fail();
+                }
+                let padding = offset - self.concrete_len;
+                if padding > 0 {
+                    self.ready.push(RawOp::Raw(vec![0; padding]));
+                }
+                self.concrete_len = offset;
+            }
         }
 
         Ok(self.concrete_len)
@@ -492,6 +530,7 @@ impl Assembler {
                     continue;
                 }
                 RawOp::Scope(_) => unreachable!("scopes should be expanded"),
+                RawOp::Org(_) => unreachable!(".org directives should be expanded to padding"),
             };
 
             match op
@@ -801,6 +840,84 @@ mod tests {
         assert_eq!(result, expected);
 
         Ok(())
+    }
+
+    #[test]
+    fn assemble_org_pads_with_zeros() -> Result<(), Error> {
+        let mut asm = Assembler::new();
+        let code: Vec<RawOp> = vec![
+            RawOp::Op(AbstractOp::new(GetPc)),
+            RawOp::Org(4),
+            RawOp::Op(AbstractOp::new(JumpDest)),
+        ];
+        let result = asm.assemble(&code)?;
+        assert_eq!(result, hex!("580000005b"));
+        Ok(())
+    }
+
+    #[test]
+    fn assemble_org_label_position() -> Result<(), Error> {
+        let mut asm = Assembler::new();
+        let code: Vec<RawOp> = vec![
+            RawOp::Op(AbstractOp::new(Push1(Imm::with_label("lbl")))),
+            RawOp::Org(0x10),
+            RawOp::Op(AbstractOp::Label("lbl".into())),
+            RawOp::Op(AbstractOp::new(JumpDest)),
+        ];
+        let result = asm.assemble(&code)?;
+        let mut expected = vec![0x60, 0x10];
+        expected.extend_from_slice(&[0; 14]);
+        expected.push(0x5b);
+        assert_eq!(result, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn assemble_org_multiple() -> Result<(), Error> {
+        let mut asm = Assembler::new();
+        let code: Vec<RawOp> = vec![
+            RawOp::Org(2),
+            RawOp::Op(AbstractOp::new(GetPc)),
+            RawOp::Org(5),
+            RawOp::Op(AbstractOp::new(JumpDest)),
+        ];
+        let result = asm.assemble(&code)?;
+        // pad-to-2, getpc (at 2), pad-to-5, jumpdest (at 5)
+        assert_eq!(result, hex!("00005800005b"));
+        Ok(())
+    }
+
+    #[test]
+    fn assemble_org_zero_padding() -> Result<(), Error> {
+        // .org equal to current position emits no padding.
+        let mut asm = Assembler::new();
+        let code: Vec<RawOp> = vec![
+            RawOp::Op(AbstractOp::new(GetPc)),
+            RawOp::Org(1),
+            RawOp::Op(AbstractOp::new(JumpDest)),
+        ];
+        let result = asm.assemble(&code)?;
+        assert_eq!(result, hex!("585b"));
+        Ok(())
+    }
+
+    #[test]
+    fn assemble_org_rewind_errors() {
+        let mut asm = Assembler::new();
+        let code: Vec<RawOp> = vec![
+            RawOp::Op(AbstractOp::new(JumpDest)),
+            RawOp::Op(AbstractOp::new(JumpDest)),
+            RawOp::Org(1),
+        ];
+        let err = asm.assemble(&code).unwrap_err();
+        assert_matches!(
+            err,
+            Error::OrgRewind {
+                current: 2,
+                requested: 1,
+                ..
+            }
+        );
     }
 
     #[test]
