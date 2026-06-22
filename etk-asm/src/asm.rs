@@ -445,13 +445,22 @@ fn build_position_map(
 }
 
 /// Construct the chunked output: leading `<size_0> JUMPDEST`, then each
-/// chunk's user bytes preceded (for chunks ≥ 1) by `PUSH1 <size_N> POP`.
+/// chunk's user bytes preceded (for chunks ≥ 1) by `PUSH1 <size_N> POP`,
+/// then the GIF sub-block-list terminator `0x00`.
+///
+/// Each `<size_N>` byte is sized per the GIF sub-block convention: it
+/// counts every byte that follows it up to (but not including) the next
+/// sub-block-size byte. For all chunks except the last one, that range
+/// includes the *next* chunk's `PUSH1` opcode — because the next sub-block
+/// size byte sits at `PUSH1 + 1`. For the last chunk the range ends at
+/// the terminator byte.
 fn assemble_chunked(unchunked: &[u8], boundaries: &ChunkBoundaries) -> Vec<u8> {
     let headers = &boundaries.header_at;
     // 9 magic bytes + 2-byte first header + 3 bytes per subsequent header
-    // + the user's bytecode.
+    // + the user's bytecode + 1-byte sub-block terminator.
     let header_bytes = 2 + 3 * headers.len().saturating_sub(1);
-    let mut out = Vec::with_capacity(EVMGIF_MAGIC.len() + header_bytes + unchunked.len());
+    let mut out =
+        Vec::with_capacity(EVMGIF_MAGIC.len() + header_bytes + unchunked.len() + 1);
 
     // Every `--evmgif` payload opens with the 9-byte magic identifier so
     // the wrapping file can distinguish embedded EVM payloads from other
@@ -471,6 +480,20 @@ fn assemble_chunked(unchunked: &[u8], boundaries: &ChunkBoundaries) -> Vec<u8> {
     for (idx, &chunk_start) in headers.iter().enumerate() {
         let end = chunk_end(idx);
         let content_len = end - chunk_start;
+        let is_last = idx + 1 == headers.len();
+
+        // `<size>` follows the GIF sub-block convention: it counts every
+        // byte from "just after this size byte" up to "just before the
+        // next sub-block size byte" (or the terminator). For non-last
+        // chunks the next size byte sits at the next chunk's `PUSH1 + 1`,
+        // so the next chunk's PUSH1 opcode is part of *this* sub-block's
+        // data — hence `+2` instead of `+1`.
+        let size = if is_last {
+            1 + content_len
+        } else {
+            2 + content_len
+        };
+        debug_assert!(size <= 0xff, "evmgif: chunk size byte must fit in u8");
 
         if idx == 0 {
             // First header: <size> JUMPDEST. The JUMPDEST is the caller's
@@ -478,24 +501,23 @@ fn assemble_chunked(unchunked: &[u8], boundaries: &ChunkBoundaries) -> Vec<u8> {
             // `<size>` byte is cleaned up *outside* this payload before
             // jumping in, so no POP is needed here. The user's program is
             // then appended verbatim.
-            //
-            // `<size>` counts the bytes that follow it before the next
-            // header (or end-of-output): JUMPDEST + content_len.
-            let size = (1 + content_len) as u8;
-            out.push(size);
+            out.push(size as u8);
             out.push(u8::from(JumpDest));
         } else {
-            // Subsequent headers: PUSH1 <size> POP. `<size>` counts the
-            // bytes after itself up to the next header (POP + content_len),
-            // which is at most 254 — within byte range.
-            let size = (1 + content_len) as u8;
+            // Subsequent headers: PUSH1 <size> POP. The PUSH1+POP is a
+            // no-op for the EVM, smuggling the GIF size byte past the
+            // execution path.
             out.push(u8::from(Push1::<()>(())));
-            out.push(size);
+            out.push(size as u8);
             out.push(u8::from(Pop));
         }
 
         out.extend_from_slice(&unchunked[chunk_start..end]);
     }
+
+    // GIF sub-block-list terminator. Also `STOP` to the EVM, so execution
+    // that runs off the end of the user's code halts cleanly.
+    out.push(0x00);
 
     out
 }
@@ -508,9 +530,10 @@ impl Assembler {
 
     /// Create a new `Assembler` in `--evmgif` mode at the given base offset.
     ///
-    /// The output is chunked with `<size> JUMPDEST` as the first header and
-    /// `PUSH1 <size> POP` between subsequent chunks, and every label
-    /// resolves to `offset + chunked_position`. The first chunk header is
+    /// The output is chunked with `<size> JUMPDEST` as the first header,
+    /// `PUSH1 <size> POP` between subsequent chunks, and a `0x00` sub-block
+    /// terminator at the end. Every label resolves to
+    /// `offset + chunked_position`. The first chunk header is
     /// assembler-emitted preamble; the user's bytecode is appended verbatim
     /// starting at `offset + 11` and the caller's entry point is the
     /// preamble `JUMPDEST` at `offset + 10`. The caller is responsible for
@@ -818,6 +841,7 @@ impl Assembler {
     /// PUSH1 <size_1> POP <chunk_1 user bytes ...>
     /// PUSH1 <size_2> POP <chunk_2 user bytes ...>
     /// ...
+    /// 0x00                                       ; sub-block terminator
     /// ```
     ///
     /// The CLI `--evmgif <offset>` argument is the byte position at which
@@ -827,11 +851,17 @@ impl Assembler {
     /// program is appended verbatim starting at `offset + 11` and may
     /// begin with any instruction. The caller is responsible for cleaning
     /// up any stack effect caused by the `<size_0>` byte before jumping
-    /// in. Each `<size_N>` byte stores the number of bytes that follow
-    /// it up to the next header (or end-of-output). The first header
-    /// omits `PUSH1` because the caller jumps directly to the preamble
-    /// `JUMPDEST`, so the leading `<size_0>` byte is never executed
-    /// linearly.
+    /// in. The trailing `0x00` is the GIF sub-block-list terminator (also
+    /// `STOP` to the EVM, so execution that falls off the end halts
+    /// cleanly).
+    ///
+    /// `<size_N>` follows the GIF sub-block convention: it counts every
+    /// byte from "just after this size byte" up to "just before the next
+    /// sub-block size byte" (or the terminator). For non-last chunks that
+    /// range includes the next chunk's `PUSH1` opcode, since the next
+    /// size byte sits at `PUSH1 + 1`. The first header omits `PUSH1`
+    /// because the caller jumps directly to the preamble `JUMPDEST`, so
+    /// the leading `<size_0>` byte is never executed linearly.
     ///
     /// Labels resolve to `offset + chunked_position`, so every push captured
     /// in [`Self::evmgif_label_pushes`] is rewritten in place. Pushes whose
@@ -1923,12 +1953,13 @@ mod tests {
 
     #[test]
     fn evmgif_empty_program_is_just_preamble() -> Result<(), Error> {
-        // With no user code at all the output is still magic + preamble.
+        // With no user code at all the output is magic + preamble +
+        // sub-block terminator.
         let mut asm = Assembler::with_evmgif_offset(0);
         let ops: Vec<AbstractOp> = vec![];
         let result = asm.assemble(&ops)?;
-        // 9 magic bytes + <size_0=1> JUMPDEST
-        assert_eq!(result, hex!("21ff064556 4d474946 015b"));
+        // 9 magic bytes + <size_0=1> JUMPDEST + terminator
+        assert_eq!(result, hex!("21ff064556 4d474946 015b 00"));
         Ok(())
     }
 
@@ -1939,15 +1970,15 @@ mod tests {
         let mut asm = Assembler::with_evmgif_offset(0);
         let ops = vec![AbstractOp::new(GetPc), AbstractOp::new(Stop)];
         let result = asm.assemble(&ops)?;
-        // MAGIC | <size_0 = 1 + 2 = 3> JUMPDEST | PC STOP
-        assert_eq!(result, hex!("21ff064556 4d474946 035b5800"));
+        // MAGIC | <size_0 = 1 + 2 = 3> JUMPDEST | PC STOP | terminator
+        assert_eq!(result, hex!("21ff064556 4d474946 035b5800 00"));
         Ok(())
     }
 
     #[test]
     fn evmgif_short_program_offset_zero() -> Result<(), Error> {
-        // Layout: MAGIC | <size_0=4> JUMPDEST JUMPDEST GAS STOP
-        // size_0 counts JUMPDEST + (user JUMPDEST + GAS + STOP) = 4.
+        // Layout: MAGIC | <size_0=4> JUMPDEST JUMPDEST GAS STOP | 0x00
+        // size_0 (last chunk) = JUMPDEST + (user JUMPDEST + GAS + STOP) = 4.
         let mut asm = Assembler::with_evmgif_offset(0);
         let ops = vec![
             AbstractOp::new(JumpDest),
@@ -1955,7 +1986,7 @@ mod tests {
             AbstractOp::new(Stop),
         ];
         let result = asm.assemble(&ops)?;
-        assert_eq!(result, hex!("21ff064556 4d474946 045b5b5a00"));
+        assert_eq!(result, hex!("21ff064556 4d474946 045b5b5a00 00"));
         Ok(())
     }
 
@@ -1974,10 +2005,11 @@ mod tests {
             AbstractOp::new(Jump),
         ];
         let result = asm.assemble(&ops)?;
-        // MAGIC | <size_0=6> JUMPDEST | JUMPDEST JUMPDEST(dest) PUSH1 0x1c JUMP
+        // MAGIC | <size_0=6> JUMPDEST | JUMPDEST JUMPDEST(dest) PUSH1 0x1c JUMP | 0x00
         let mut expected = EVMGIF_MAGIC.to_vec();
         expected.extend_from_slice(&hex!("065b"));
         expected.extend_from_slice(&hex!("5b5b601c56"));
+        expected.push(0x00);
         assert_eq!(result, expected);
         Ok(())
     }
@@ -1990,15 +2022,19 @@ mod tests {
         let mut asm = Assembler::with_evmgif_offset(0);
         let result = asm.assemble(&ops)?;
 
-        // MAGIC (9) | <size_0 = 1 + 253 = 254> JUMPDEST (2)
+        // MAGIC (9) | <size_0 = 2 + 253 = 255> JUMPDEST (2)
+        //   (non-last: size includes the next chunk's PUSH1 opcode byte)
         // Chunk 0 content: 253 GAS bytes.
         // PUSH1 <size_1 = 1 + 2 = 3> POP (3)
+        //   (last: size = POP + content)
         // Chunk 1 content: 2 GAS bytes.
+        // 0x00 terminator.
         let mut expected = EVMGIF_MAGIC.to_vec();
-        expected.extend_from_slice(&[254u8, u8::from(JumpDest)]);
+        expected.extend_from_slice(&[255u8, u8::from(JumpDest)]);
         expected.extend(std::iter::repeat(0x5a).take(253));
         expected.extend_from_slice(&[u8::from(Push1::<()>(())), 0x03, u8::from(Pop)]);
         expected.extend(std::iter::repeat(0x5a).take(2));
+        expected.push(0x00);
         assert_eq!(result, expected);
         Ok(())
     }
@@ -2036,8 +2072,47 @@ mod tests {
         assert_eq!(result[265], 0x05);
         assert_eq!(result[266], u8::from(Pop));
 
-        // And the leading 9 bytes are the magic identifier.
+        // Leading 9 bytes are the magic identifier.
         assert_eq!(&result[..9], &EVMGIF_MAGIC);
+        // Trailing byte is the sub-block-list terminator.
+        assert_eq!(*result.last().unwrap(), 0x00);
+        Ok(())
+    }
+
+    #[test]
+    fn evmgif_does_not_split_multibyte_push_across_chunk_boundary() -> Result<(), Error> {
+        // Place a PUSH4 right where chunk 0 would naively want to break:
+        // 250 GAS (250 bytes) then PUSH4 (5 bytes). 250 + 5 = 255 > 253,
+        // so the whole PUSH4 instruction must spill into chunk 1; the
+        // chunker is *not* allowed to split between the PUSH4 opcode and
+        // its 4-byte immediate.
+        let mut ops: Vec<AbstractOp> = Vec::new();
+        for _ in 0..250 {
+            ops.push(AbstractOp::new(Gas));
+        }
+        ops.push(AbstractOp::new(Push4([0xde, 0xad, 0xbe, 0xef].into())));
+
+        let mut asm = Assembler::with_evmgif_offset(0);
+        let result = asm.assemble(&ops)?;
+
+        // Expected layout:
+        //   MAGIC (9) | size_0 = 2 + 250 = 252 | JUMPDEST | 250×GAS
+        //   PUSH1 | size_1 = 1 + 5 = 6 | POP | PUSH4 de ad be ef
+        //   0x00
+        let mut expected = EVMGIF_MAGIC.to_vec();
+        expected.extend_from_slice(&[252u8, u8::from(JumpDest)]);
+        expected.extend(std::iter::repeat(0x5a).take(250));
+        expected.extend_from_slice(&[u8::from(Push1::<()>(())), 0x06, u8::from(Pop)]);
+        expected.extend_from_slice(&hex!("63deadbeef")); // PUSH4 + immediate
+        expected.push(0x00);
+        assert_eq!(result, expected);
+
+        // Sanity: the PUSH4 opcode and all 4 immediate bytes are
+        // contiguous in the chunked output — no header sneaks in
+        // between them.
+        let push4_pos = 9 + 2 + 250 + 3; // MAGIC + preamble + chunk0 + chunk1 header
+        assert_eq!(result[push4_pos], 0x63);
+        assert_eq!(&result[push4_pos + 1..push4_pos + 5], &hex!("deadbeef"));
         Ok(())
     }
 
@@ -2057,13 +2132,15 @@ mod tests {
     }
 
     #[test]
-    fn evmgif_prepends_magic_header() -> Result<(), Error> {
-        // Regardless of program content, every --evmgif payload starts with
-        // the 9-byte magic header.
+    fn evmgif_prepends_magic_header_and_terminates() -> Result<(), Error> {
+        // Regardless of program content, every --evmgif payload starts
+        // with the 9-byte magic header and ends with the sub-block-list
+        // terminator.
         let mut asm = Assembler::with_evmgif_offset(0);
         let ops = vec![AbstractOp::new(JumpDest), AbstractOp::new(Stop)];
         let result = asm.assemble(&ops)?;
         assert_eq!(&result[..9], &EVMGIF_MAGIC);
+        assert_eq!(*result.last().unwrap(), 0x00);
         Ok(())
     }
 
