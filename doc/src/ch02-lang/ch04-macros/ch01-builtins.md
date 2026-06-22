@@ -69,7 +69,37 @@ push1 0x00
 
 ### `%include_hex("...")`
 
-The `%include_hex` macro functions exactly like `%include`, except instead of assembling the given path, it includes the raw hexadecimal bytes.
+The `%include_hex` macro reads the file at the given path, decodes its contents as a hexadecimal string, and inserts the resulting raw bytes verbatim into the output at the macro's location. Unlike `%import` and `%include`, the file is _not_ parsed or assembled as etk source — it is treated as pre-assembled bytecode.
+
+The file is expected to contain a single hexadecimal string (leading and trailing whitespace are trimmed). The decoded bytes are emitted as-is, so the included file is responsible for being valid EVM bytecode in its own right; the assembler will not insert any padding, jumpdests, or other instructions around it.
+
+The path is resolved relative to the current file.
+
+#### Source: `main.etk`
+
+```ignore
+push1 0x00
+
+%include_hex("payload.hex")
+
+stop
+```
+
+#### Source: `payload.hex`
+
+```ignore
+cafeb0ba
+```
+
+#### After Expansion
+
+The four bytes from `payload.hex` are spliced directly between the surrounding instructions, producing the byte sequence:
+
+```ignore
+60 00 ca fe b0 ba 00
+```
+
+Because the included bytes are opaque to the assembler, labels defined in the including file are not visible inside the hex payload, and the payload cannot define labels visible to the including file.
 
 ### `%push(...)`
 
