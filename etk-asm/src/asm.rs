@@ -417,10 +417,11 @@ fn plan_chunks(instr_starts: &[usize], unchunked_len: usize) -> ChunkBoundaries 
     }
 }
 
-/// Build a lookup from unchunked offsets to chunked offsets. Only
-/// instruction-start positions are entered; intermediate bytes inside a
-/// multi-byte push never appear in any resolved expression, so they don't
-/// need a mapping.
+/// Build a lookup from unchunked offsets to chunked offsets. Every position
+/// where a label can be declared is entered: every instruction start, plus
+/// `unchunked_len` itself (labels declared after the last op resolve there).
+/// Intermediate bytes inside a multi-byte push never appear in any resolved
+/// expression, so they don't need a mapping.
 fn build_position_map(
     instr_starts: &[usize],
     boundaries: &ChunkBoundaries,
@@ -432,7 +433,8 @@ fn build_position_map(
     // plus three bytes for each non-initial header that precedes it, plus
     // the constant 9-byte magic prefix that opens the file.
     let mut chunk_idx = 0usize;
-    for &start in instr_starts.iter() {
+    let end_of_code = boundaries.unchunked_len;
+    for &start in instr_starts.iter().chain(std::iter::once(&end_of_code)) {
         while chunk_idx + 1 < boundaries.header_at.len()
             && start >= boundaries.header_at[chunk_idx + 1]
         {
@@ -2076,6 +2078,24 @@ mod tests {
         assert_eq!(&result[..9], &EVMGIF_MAGIC);
         // Trailing byte is the sub-block-list terminator.
         assert_eq!(*result.last().unwrap(), 0x00);
+        Ok(())
+    }
+
+    #[test]
+    fn evmgif_label_at_end_of_code_does_not_panic() -> Result<(), Error> {
+        // Regression: a label declared after the last instruction has
+        // `position == unchunked_len`, which is not an instruction-start
+        // and therefore wasn't in the position map. Used to panic with
+        // "label position must be an instruction boundary".
+        let mut asm = Assembler::with_evmgif_offset(0);
+        let ops = vec![
+            AbstractOp::new(Push1(Imm::from(6u8))),
+            AbstractOp::new(Stop),
+            AbstractOp::Label("tail".into()),
+        ];
+        // Should assemble cleanly even though `tail` resolves to the
+        // byte just past `STOP`.
+        asm.assemble(&ops)?;
         Ok(())
     }
 
