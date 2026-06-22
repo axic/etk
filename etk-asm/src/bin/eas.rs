@@ -19,13 +19,15 @@ struct Opt {
 
     /// Emit `--evmgif` chunked output at the given base byte offset.
     ///
-    /// Prepends the 9-byte magic header `21 FF 06 'EVMGIF'`, then emits the
-    /// preamble `<size> JUMPDEST POP`, then the user's bytecode interleaved
-    /// with `PUSH1 <size> POP` headers so each inter-header span is at most
-    /// 256 bytes. `OFFSET` is the byte position of the leading `0x21` magic
-    /// byte in the wrapping file; the caller jumps to the preamble JUMPDEST
-    /// at `OFFSET + 10` and the user's first instruction sits at
-    /// `OFFSET + 12`. Every label-bearing push resolves to its chunked
+    /// Prepends the 9-byte magic header `21 FF 06 'EVMGIF'`, then the
+    /// 2-byte preamble `<size> JUMPDEST`, then the user's bytecode
+    /// interleaved with `PUSH1 <size> POP` headers so each inter-header
+    /// span is at most 256 bytes. `OFFSET` is the byte position of the
+    /// leading `0x21` magic byte in the wrapping file; the caller jumps
+    /// to the preamble JUMPDEST at `OFFSET + 10` and the user's first
+    /// instruction sits at `OFFSET + 11`. The caller is responsible for
+    /// cleaning up any stack effect from the `<size_0>` byte before
+    /// jumping in. Every label-bearing push resolves to its chunked
     /// position plus that base offset. Accepts decimal or `0x`-prefixed
     /// hexadecimal.
     #[structopt(long = "evmgif", value_name = "OFFSET", parse(try_from_str = parse_offset))]
